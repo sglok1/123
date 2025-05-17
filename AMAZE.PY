@@ -10,7 +10,6 @@ from collections import defaultdict
 # ==================== CONFIGURATION ====================
 load_dotenv()
 
-# Validate environment variables
 def get_env_var(name, is_int=True):
     value = os.getenv(name)
     if not value:
@@ -18,30 +17,35 @@ def get_env_var(name, is_int=True):
     return int(value) if is_int else value
 
 TOKEN = get_env_var("DISCORD_TOKEN", is_int=False)
-OWNER_ID = get_env_var("OWNER_ID")
-LOG_CHANNEL_ID = get_env_var("LOG_CHANNEL_ID")
 
-# Bot setup
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Security settings
-whitelisted = {OWNER_ID}
+# Runtime config
+owner_id = None
+log_channel_id = None
+whitelisted = set()
+
+# Moderation patterns and settings
 LINK_PATTERN = re.compile(r"(https?://\S+|www\.\S+)")
 ban_count = defaultdict(int)
-TIMEOUT_DURATION = 600  # 10 minutes timeout for @everyone @here
+TIMEOUT_DURATION = 600  # seconds
 
 # ==================== HELPER FUNCTIONS ====================
+def update_whitelist():
+    global whitelisted
+    whitelisted = {owner_id} if owner_id else set()
+
 async def send_dm(user, message):
-    """Sends a DM to the user."""
     try:
         await user.send(f"🔔 **Server Security Alert** 🔔\n{message}")
     except discord.Forbidden:
         print(f"Could not DM {user}")
 
 async def log_action(guild, message):
-    """Logs actions to a specific log channel."""
-    log_channel = guild.get_channel(LOG_CHANNEL_ID)
+    if not log_channel_id:
+        return
+    log_channel = guild.get_channel(log_channel_id)
     if log_channel:
         embed = discord.Embed(
             description=message,
@@ -49,6 +53,12 @@ async def log_action(guild, message):
             timestamp=datetime.utcnow()
         )
         await log_channel.send(embed=embed)
+
+# ==================== CHECKS ====================
+def is_owner():
+    async def predicate(ctx):
+        return ctx.author.id == owner_id
+    return commands.check(predicate)
 
 # ==================== BOT EVENTS ====================
 @bot.event
@@ -61,7 +71,6 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    """Message moderation system."""
     if message.author.bot:
         return
 
@@ -69,7 +78,7 @@ async def on_message(message):
     if LINK_PATTERN.search(message.content) and message.author.id not in whitelisted:
         await message.delete()
         await send_dm(message.author, "🚫 **Links are not allowed in this server!**")
-        await log_action(message.guild, 
+        await log_action(message.guild,
             f"❌ {message.author.mention} tried to send a link in {message.channel.mention}.\n"
             f"**Message:** {message.content[:100]}..."
         )
@@ -94,7 +103,6 @@ async def on_message(message):
 # ==================== SECURITY EVENTS ====================
 @bot.event
 async def on_guild_channel_create(channel):
-    """Prevents unauthorized channel creation."""
     async for entry in channel.guild.audit_logs(action=discord.AuditLogAction.channel_create, limit=1):
         if entry.user.id not in whitelisted:
             await channel.delete()
@@ -105,7 +113,6 @@ async def on_guild_channel_create(channel):
 
 @bot.event
 async def on_guild_role_create(role):
-    """Prevents unauthorized role creation."""
     async for entry in role.guild.audit_logs(action=discord.AuditLogAction.role_create, limit=1):
         if entry.user.id not in whitelisted:
             await role.delete()
@@ -116,7 +123,6 @@ async def on_guild_role_create(role):
 
 @bot.event
 async def on_member_ban(guild, user):
-    """Prevents unauthorized bans."""
     async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=1):
         if entry.user.id not in whitelisted:
             await guild.ban(entry.user, reason="Unauthorized ban attempt")
@@ -124,9 +130,33 @@ async def on_member_ban(guild, user):
                 f"🚨 {entry.user.mention} was banned for trying to ban {user.mention}"
             )
 
+# ==================== OWNER SETUP COMMANDS ====================
+@bot.command()
+async def setowner(ctx, member: discord.Member):
+    """Sets the bot owner (only usable once)."""
+    global owner_id
+    if owner_id is not None:
+        await ctx.send("❌ Owner is already set. Restart bot to reset.")
+        return
+    owner_id = member.id
+    update_whitelist()
+    await ctx.send(f"👑 {member.mention} is now the bot owner.")
+    await log_action(ctx.guild, f"👑 Owner set to {member.mention} by {ctx.author.mention}")
+
+@bot.command()
+async def setlogchannel(ctx, channel: discord.TextChannel):
+    """Sets the log channel."""
+    global log_channel_id
+    if ctx.author.id != owner_id:
+        await ctx.send("🚫 Only the bot owner can set the log channel.")
+        return
+    log_channel_id = channel.id
+    await ctx.send(f"📓 Logging channel set to {channel.mention}.")
+    await log_action(ctx.guild, f"📓 Log channel set to {channel.mention} by {ctx.author.mention}")
+
 # ==================== MODERATION COMMANDS ====================
 @bot.command()
-@commands.is_owner()
+@is_owner()
 async def whitelist(ctx, member: discord.Member):
     """Adds a user to the whitelist."""
     whitelisted.add(member.id)
@@ -136,7 +166,7 @@ async def whitelist(ctx, member: discord.Member):
     )
 
 @bot.command()
-@commands.is_owner()
+@is_owner()
 async def unwhitelist(ctx, member: discord.Member):
     """Removes a user from the whitelist."""
     whitelisted.discard(member.id)
@@ -152,8 +182,8 @@ async def on_command_error(ctx, error):
         return
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("❌ Missing required arguments!")
-    elif isinstance(error, commands.NotOwner):
-        await ctx.send("🚫 This command is for bot owners only!")
+    elif isinstance(error, commands.CheckFailure):
+        await ctx.send("🚫 You are not authorized to use this command.")
     else:
         await log_action(ctx.guild,
             f"⚠️ Error in command `{ctx.command}`: {str(error)}"
